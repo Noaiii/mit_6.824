@@ -18,8 +18,10 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"../labrpc"
 )
@@ -44,12 +46,23 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
-// LogEntry
-type LogEntry struct {
+// Command
+type Command struct {
 	k  string
 	op string
 	v  interface{}
 }
+
+type LogEntry struct {
+	command Command
+	term    int
+}
+
+const (
+	Leader    = 1
+	Folower   = 2
+	candidate = 3
+)
 
 //
 // A Go object implementing a single Raft peer.
@@ -61,20 +74,42 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	role int16
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// electionChan chan interface{}
+	roleChangeChan chan int16
+	// 所有服务器上持久存在的
 	currentTerm int // 服务器最后一次知道的任期号（初始化为 0，持续递增）
 	votedFor    int // 在当前获得选票的候选人的 Id
+	log         []LogEntry
+
+	// 所有服务器经常变的
+	commitIndex int //已知的最大的已经被提交的日志条目的索引值
+	lastApplied int //最后被应用到状态机的日志条目索引值（初始化为 0，持续递增）
+
+	//在领导人里经常改变的 （选举后重新初始化）
+	nextIndex  []int //对于每一个服务器，需要发送给他的下一个日志条目的索引值（初始化为领导人最后索引值加一）
+	matchIndex []int //对于每一个服务器，已经复制给他的日志的最高索引值
+
+	wg sync.WaitGroup
 }
 
+// GetState is
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
+	if rf.role == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
+	term = rf.currentTerm
 	// Your code here (2A).
 	return term, isleader
 }
@@ -123,35 +158,37 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int // 候选人的任期号
-	CandidateID int // 请求选票的候选人的 Id
+	Term         int // 候选人的任期号
+	CandidateID  int // 请求选票的候选人的 Id
+	LastLogIndex int //候选人的最后日志条目的索引值
+	LastLogTerm  int //候选人最后日志条目的任期号
 }
 
-//
+// RequestVoteReply is
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int  // 当前任期号，以便于候选人去更新自己的任期号
 	VoteGranted bool // 候选人赢得了此张选票时为真
 }
 
-//
+// RequestVote is
 // example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		return reply
 	}
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateID && args.LastLogIndex >= rf.lastApplied {
 		// 候选人的日志至少和自己一样新，那么就投票给他
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateID
+		rf.mu.Unlock()
 		reply.Term = args.Term
 		reply.VoteGranted = true
-		return reply
 	}
 }
 
@@ -186,6 +223,72 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) ProcessVote() {
+	rf.mu.Lock()
+	rf.currentTerm++
+	rf.mu.Unlock()
+	// 发起选举请求
+	args := &RequestVoteArgs{}
+	args.CandidateID = rf.me
+	args.LastLogIndex = rf.lastApplied
+	if len(rf.log) == 0 {
+		args.LastLogTerm = 0
+	} else {
+		args.LastLogTerm = rf.log[rf.lastApplied].term
+	}
+	reply := &RequestVoteReply{}
+	voteCount := 0
+	for i, _ := range rf.peers {
+		rf.wg.Add(1)
+		go func(peerIndex int) {
+			defer rf.wg.Done()
+			ok := rf.sendRequestVote(peerIndex, args, reply)
+			if ok {
+				DPrintf("Raft Node %d requestVote res: %v", rf.me, reply)
+				if reply.VoteGranted {
+					voteCount++
+				}
+			}
+		}(i)
+	}
+	rf.wg.Wait()
+	DPrintf("Raft Node %d received %d votes, total: %d votes", rf.me, voteCount, len(rf.peers))
+	if voteCount*2 > len(rf.peers) {
+		rf.mu.Lock()
+		rf.role = Leader
+		rf.roleChangeChan <- Leader
+		rf.mu.Unlock()
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term         int        //领导人的任期号
+	LeaderID     int        //领导人的 Id，以便于跟随者重定向请求
+	PrevLogIndex int        //新的日志条目紧随之前的索引值
+	PrevLogTerm  int        //prevLogIndex 条目的任期号
+	Entries      []LogEntry //准备存储的日志条目（表示心跳时为空；一次性发送多个是为了提高效率）
+	LeaderCommit int        //领导人已经提交的日志的索引值
+}
+
+type AppendEntriesReply struct {
+	Term    int  // 当前任期号，以便于候选人去更新自己的任期号
+	Success bool // 跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的日志时为真
+}
+
+// AppendEntries is
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+	}
+	// heartbeat
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -245,14 +348,49 @@ func (rf *Raft) killed() bool {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	DPrintf("Start Raft node: %d", me)
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
+	// rf.log = []Command{}
+	rf.votedFor = -1
+	rf.lastApplied = 0
+	rf.role = Folower
+	// rf.electionChan = make(chan struct{})
+	rf.roleChangeChan = make(chan int16)
+
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// rf.currentTerm = rf.log[-1].term
+
+	// 选举倒计时循环
+	go func() {
+		randDuration := time.Duration(rand.Float32()*150.0+150.0) * time.Millisecond
+		DPrintf("Raft Node %d election timeout: %v ms", rf.me, randDuration)
+		time.Sleep(randDuration)
+		// rf.electionChan <- struct{}{}
+		rf.roleChangeChan <- candidate
+	}()
+
+	go func() {
+		select {
+		case i := <-rf.roleChangeChan:
+			DPrintf("Raft Node %d change to %v", rf.me, i)
+			switch i {
+			case candidate:
+				go func() {
+					rf.ProcessVote()
+				}()
+			case Leader:
+				// DPrintf("Raft Node %d change to %v", rf.me, i)
+			case Folower:
+				// DPrintf("Raft Node %d change to %v", rf.me, i)
+			}
+		}
+	}()
 	return rf
 }
