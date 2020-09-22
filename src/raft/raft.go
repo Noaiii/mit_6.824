@@ -58,11 +58,20 @@ type LogEntry struct {
 	term    int
 }
 
+type Role uint16
+
 const (
-	Leader    = 1
-	Folower   = 2
-	candidate = 3
+	Leader    Role = 1
+	Folower   Role = 2
+	Candidate Role = 3
+
+	minTimeout = 150
+	maxTimeout = 300
 )
+
+func randTimeOut() time.Duration {
+	return time.Duration(rand.Float32()*(maxTimeout-minTimeout)+minTimeout) * time.Millisecond
+}
 
 //
 // A Go object implementing a single Raft peer.
@@ -74,13 +83,13 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	role int16
+	role Role
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 	// electionChan chan interface{}
-	roleChangeChan chan int16
+	roleChangeChan chan Role
 	// 所有服务器上持久存在的
 	currentTerm int // 服务器最后一次知道的任期号（初始化为 0，持续递增）
 	votedFor    int // 在当前获得选票的候选人的 Id
@@ -94,7 +103,9 @@ type Raft struct {
 	nextIndex  []int //对于每一个服务器，需要发送给他的下一个日志条目的索引值（初始化为领导人最后索引值加一）
 	matchIndex []int //对于每一个服务器，已经复制给他的日志的最高索引值
 
-	wg sync.WaitGroup
+	wg               sync.WaitGroup
+	heartBeatTime    time.Time
+	heartBeatTimeOut time.Duration
 }
 
 // GetState is
@@ -177,6 +188,9 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	rf.heartBeatTime = time.Now()
+	rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -187,8 +201,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateID
 		rf.mu.Unlock()
+		rf.changeRole(Folower)
 		reply.Term = args.Term
 		reply.VoteGranted = true
+		DPrintf("Raft Node %d vote for: %d", rf.me, args.CandidateID)
 	}
 }
 
@@ -227,12 +243,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) ProcessVote() {
+	DPrintf("Raft Node %d start request votes", rf.me)
 	rf.mu.Lock()
 	rf.currentTerm++
+	DPrintf("Raft Node %d become term %d", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 	// 发起选举请求
 	args := &RequestVoteArgs{}
 	args.CandidateID = rf.me
+	args.Term = rf.currentTerm
 	args.LastLogIndex = rf.lastApplied
 	if len(rf.log) == 0 {
 		args.LastLogTerm = 0
@@ -241,22 +260,25 @@ func (rf *Raft) ProcessVote() {
 	}
 	reply := &RequestVoteReply{}
 	voteCount := 0
-	for i, _ := range rf.peers {
-		rf.wg.Add(1)
-		go func(peerIndex int) {
-			defer rf.wg.Done()
-			ok := rf.sendRequestVote(peerIndex, args, reply)
-			if ok {
-				DPrintf("Raft Node %d requestVote res: %v", rf.me, reply)
-				if reply.VoteGranted {
-					voteCount++
+	for i := range rf.peers {
+		if i != rf.me {
+			rf.wg.Add(1)
+			go func(peerIndex int) {
+				defer rf.wg.Done()
+				ok := rf.sendRequestVote(peerIndex, args, reply)
+				if ok {
+					DPrintf("Raft Node %d requestVote res: %v", rf.me, reply)
+					if reply.VoteGranted {
+						voteCount++
+					}
 				}
-			}
-		}(i)
+			}(i)
+		}
 	}
 	rf.wg.Wait()
 	DPrintf("Raft Node %d received %d votes, total: %d votes", rf.me, voteCount, len(rf.peers))
 	if voteCount*2 > len(rf.peers) {
+		DPrintf("Raft Node %d will become leader", rf.me)
 		rf.mu.Lock()
 		rf.role = Leader
 		rf.roleChangeChan <- Leader
@@ -280,6 +302,7 @@ type AppendEntriesReply struct {
 
 // AppendEntries is
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.heartBeatTime = time.Now()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -290,6 +313,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
+	// 发起选举请求
+	args := &AppendEntriesArgs{}
+	args.Term = rf.currentTerm
+	args.Entries = entry
+
+	reply := &AppendEntriesReply{}
+	succeedCount := 0
+	for i := range rf.peers {
+		if i != rf.me {
+			rf.wg.Add(1)
+			go func(peerIndex int) {
+				defer rf.wg.Done()
+				ok := rf.sendAppendEntries(peerIndex, args, reply)
+				if ok {
+					DPrintf("Raft Node %d requestVote res: %v", rf.me, reply)
+					if reply.Success {
+						succeedCount++
+					}
+				}
+			}(i)
+		}
+	}
+	rf.wg.Wait()
+	DPrintf("Raft Node %d received %d ack, total: %d request", rf.me, succeedCount, len(rf.peers))
+	if succeedCount*2 > len(rf.peers) {
+		// TODO: commit
+	}
 }
 
 //
@@ -336,6 +389,14 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) changeRole(r Role) {
+	DPrintf("Raft Node %d change to %v", rf.me, r)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.role = r
+	rf.roleChangeChan <- r
+}
+
 // Make the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -359,7 +420,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.role = Folower
 	// rf.electionChan = make(chan struct{})
-	rf.roleChangeChan = make(chan int16)
+	rf.roleChangeChan = make(chan Role)
+	rf.heartBeatTime = time.Now()
+	rf.heartBeatTimeOut = randTimeOut()
 
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
@@ -369,23 +432,34 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// 选举倒计时循环
 	go func() {
-		randDuration := time.Duration(rand.Float32()*150.0+150.0) * time.Millisecond
-		DPrintf("Raft Node %d election timeout: %v ms", rf.me, randDuration)
-		time.Sleep(randDuration)
-		// rf.electionChan <- struct{}{}
-		rf.roleChangeChan <- candidate
+		// TODO: 当收到AppendEnry时，重新开始倒计时
+		if rf.role == Folower {
+			for {
+				if rf.role == Folower {
+					if time.Now().Sub(rf.heartBeatTime) > rf.heartBeatTimeOut {
+						rf.changeRole(Candidate)
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 	}()
 
 	go func() {
 		select {
 		case i := <-rf.roleChangeChan:
-			DPrintf("Raft Node %d change to %v", rf.me, i)
 			switch i {
-			case candidate:
+			case Candidate:
 				go func() {
 					rf.ProcessVote()
 				}()
 			case Leader:
+				go func() {
+					for {
+						rf.ProcessAppendEntries([]LogEntry{})
+					}
+					time.Sleep(100 * time.Millisecond)
+				}()
 				// DPrintf("Raft Node %d change to %v", rf.me, i)
 			case Folower:
 				// DPrintf("Raft Node %d change to %v", rf.me, i)
