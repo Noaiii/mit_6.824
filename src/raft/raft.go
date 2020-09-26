@@ -48,14 +48,14 @@ type ApplyMsg struct {
 
 // Command
 type Command struct {
-	k  string
-	op string
-	v  interface{}
+	K  string
+	OP string
+	V  interface{}
 }
 
 type LogEntry struct {
-	command Command
-	term    int
+	Command Command
+	Term    int
 }
 
 type Role uint16
@@ -256,7 +256,7 @@ func (rf *Raft) ProcessVote() {
 	if len(rf.log) == 0 {
 		args.LastLogTerm = 0
 	} else {
-		args.LastLogTerm = rf.log[rf.lastApplied].term
+		args.LastLogTerm = rf.log[rf.lastApplied].Term
 	}
 	reply := &RequestVoteReply{}
 	voteCount := 0
@@ -302,21 +302,32 @@ type AppendEntriesReply struct {
 
 // AppendEntries is
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.heartBeatTime = time.Now()
+	now := time.Now()
+	DPrintf("Raft Node %d received RPC: AppendEntries at %v", rf.me, now)
+	rf.mu.Lock()
+	rf.heartBeatTime = now
+	rf.mu.Unlock()
+	DPrintf("Raft Node %d heartbeat time change to %v", rf.me, rf.heartBeatTime)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.changeRole(Candidate)
 	}
+	reply.Term = args.Term
+	reply.Success = true
 	// heartbeat
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("Raft Node %d start send RPC:sendAppendEntries for node %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
+// ProcessAppendEntries is
+// 发送附加日志请求
 func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
-	// 发起选举请求
+	DPrintf("Raft Node %d start AppendEntries", rf.me)
 	args := &AppendEntriesArgs{}
 	args.Term = rf.currentTerm
 	args.Entries = entry
@@ -330,9 +341,13 @@ func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
 				defer rf.wg.Done()
 				ok := rf.sendAppendEntries(peerIndex, args, reply)
 				if ok {
-					DPrintf("Raft Node %d requestVote res: %v", rf.me, reply)
+					DPrintf("Raft Node %d AppendEntries res: %v", rf.me, reply)
 					if reply.Success {
 						succeedCount++
+					} else {
+						if reply.Term > rf.currentTerm {
+							rf.changeRole(Folower)
+						}
 					}
 				}
 			}(i)
@@ -342,6 +357,9 @@ func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
 	DPrintf("Raft Node %d received %d ack, total: %d request", rf.me, succeedCount, len(rf.peers))
 	if succeedCount*2 > len(rf.peers) {
 		// TODO: commit
+		DPrintf("Raft Node %d ProcessAppendEntries succeed", rf.me)
+	} else {
+		DPrintf("Raft Node %d ProcessAppendEntries failed", rf.me)
 	}
 }
 
@@ -424,6 +442,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.roleChangeChan = make(chan Role)
 	rf.heartBeatTime = time.Now()
 	rf.heartBeatTimeOut = randTimeOut()
+	DPrintf("Raft Node %d heartbeat timeout is %v", rf.me, rf.heartBeatTimeOut)
 
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
@@ -434,36 +453,48 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 选举倒计时循环
 	go func() {
 		// TODO: 当收到AppendEnry时，重新开始倒计时
-		if rf.role == Folower {
-			for {
-				if rf.role == Folower {
-					if time.Now().Sub(rf.heartBeatTime) > rf.heartBeatTimeOut {
-						rf.changeRole(Candidate)
-					}
+		for {
+			if rf.role == Folower {
+				now := time.Now()
+				t := now.Sub(rf.heartBeatTime)
+				DPrintf("Raft Folower Node %d heartbeat cost %v", rf.me, t)
+				if t > rf.heartBeatTimeOut {
+					DPrintf("Raft Folower Node %d received heartbeat timeout", rf.me)
+					rf.changeRole(Candidate)
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
+			time.Sleep(30 * time.Millisecond)
 		}
 	}()
 
 	go func() {
-		select {
-		case i := <-rf.roleChangeChan:
-			switch i {
-			case Candidate:
-				go func() {
-					rf.ProcessVote()
-				}()
-			case Leader:
-				go func() {
-					for {
-						rf.ProcessAppendEntries([]LogEntry{})
-					}
-					time.Sleep(100 * time.Millisecond)
-				}()
-				// DPrintf("Raft Node %d change to %v", rf.me, i)
-			case Folower:
-				// DPrintf("Raft Node %d change to %v", rf.me, i)
+		for {
+			select {
+			case i := <-rf.roleChangeChan:
+				switch i {
+				case Candidate:
+					// time.Sleep(rf.heartBeatTimeOut	)
+					go func() {
+						rf.ProcessVote()
+					}()
+				case Leader:
+					go func() {
+						for {
+							if rf.role != Leader {
+								break
+							}
+							rf.ProcessAppendEntries([]LogEntry{{Command{}, rf.currentTerm}})
+							time.Sleep(100 * time.Millisecond)
+						}
+					}()
+					// DPrintf("Raft Node %d change to %v", rf.me, i)
+				case Folower:
+					now := time.Now()
+					DPrintf("Raft Folower Node %d set heartbeat %v", rf.me, now)
+					rf.mu.Lock()
+					rf.heartBeatTime = now
+					rf.mu.Unlock()
+				}
 			}
 		}
 	}()
