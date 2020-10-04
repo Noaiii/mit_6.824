@@ -67,6 +67,8 @@ const (
 
 	minTimeout = 150
 	maxTimeout = 300
+
+	HeartBeatInterval = 100
 )
 
 func randTimeOut() time.Duration {
@@ -195,13 +197,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	}
+	if args.Term > rf.currentTerm {
+		if !rf.isFollower() {
+			rf.changeRole(Folower)
+		}
+	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID && args.LastLogIndex >= rf.lastApplied {
 		// 候选人的日志至少和自己一样新，那么就投票给他
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateID
 		rf.mu.Unlock()
-		rf.changeRole(Folower)
+		// rf.changeRole(Folower)
 		reply.Term = args.Term
 		reply.VoteGranted = true
 		DPrintf("Raft Node %d vote for: %d", rf.me, args.CandidateID)
@@ -242,7 +249,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) ProcessVote() {
+func (rf *Raft) ProcessVote() Role {
+	if !rf.isCandicate() {
+		return rf.role
+	}
 	DPrintf("Raft Node %d start request votes", rf.me)
 	rf.mu.Lock()
 	rf.currentTerm++
@@ -259,7 +269,11 @@ func (rf *Raft) ProcessVote() {
 		args.LastLogTerm = rf.log[rf.lastApplied].Term
 	}
 	reply := &RequestVoteReply{}
-	voteCount := 0
+	// 为自己投票
+	rf.mu.Lock()
+	rf.votedFor = rf.me
+	rf.mu.Unlock()
+	voteCount := 1
 	for i := range rf.peers {
 		if i != rf.me {
 			rf.wg.Add(1)
@@ -279,11 +293,10 @@ func (rf *Raft) ProcessVote() {
 	DPrintf("Raft Node %d received %d votes, total: %d votes", rf.me, voteCount, len(rf.peers))
 	if voteCount*2 > len(rf.peers) {
 		DPrintf("Raft Node %d will become leader", rf.me)
-		rf.mu.Lock()
-		rf.role = Leader
-		rf.roleChangeChan <- Leader
-		rf.mu.Unlock()
+		rf.changeRole(Leader)
+		return Leader
 	}
+	return rf.role
 }
 
 type AppendEntriesArgs struct {
@@ -308,13 +321,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.heartBeatTime = now
 	rf.mu.Unlock()
 	DPrintf("Raft Node %d heartbeat time change to %v", rf.me, rf.heartBeatTime)
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		rf.changeRole(Candidate)
+	if args.Term != rf.currentTerm {
+		if rf.currentTerm > args.Term {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			// rf.changeRole(Candidate)
+		} else {
+			if !rf.isFollower() {
+				rf.changeRole(Folower)
+			}
+			reply.Term = rf.currentTerm
+			reply.Success = true
+		}
+	} else {
+		reply.Term = args.Term
+		reply.Success = true
 	}
-	reply.Term = args.Term
-	reply.Success = true
 	// heartbeat
 }
 
@@ -354,7 +376,7 @@ func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
 		}
 	}
 	rf.wg.Wait()
-	DPrintf("Raft Node %d received %d ack, total: %d request", rf.me, succeedCount, len(rf.peers))
+	DPrintf("Raft Node %d received %d ack, total: %d request", rf.me, succeedCount, len(rf.peers)-1)
 	if succeedCount*2 > len(rf.peers) {
 		// TODO: commit
 		DPrintf("Raft Node %d ProcessAppendEntries succeed", rf.me)
@@ -408,12 +430,58 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) isLeader() bool {
+	if rf.role == Leader {
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) isCandicate() bool {
+	if rf.role == Candidate {
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) isFollower() bool {
+	if rf.role == Folower {
+		return true
+	}
+	return false
+}
+
 func (rf *Raft) changeRole(r Role) {
 	DPrintf("Raft Node %d change to %v", rf.me, r)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.role = r
 	rf.roleChangeChan <- r
+}
+
+func (rf *Raft) detectAppendTimeOut() bool {
+	for {
+		if !rf.isFollower() {
+			return false
+		}
+		now := time.Now()
+		t := now.Sub(rf.heartBeatTime)
+		DPrintf("Raft Folower Node %d heartbeat cost %v", rf.me, t)
+		if t > rf.heartBeatTimeOut {
+			DPrintf("Raft Folower Node %d received heartbeat timeout", rf.me)
+			// rf.changeRole(Candidate)
+			return true
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) resetHeartBeatTimeOut() {
+	now := time.Now()
+	DPrintf("Raft Node %d set heartbeat %v", rf.me, now)
+	rf.mu.Lock()
+	rf.heartBeatTime = now
+	rf.mu.Unlock()
 }
 
 // Make the service or tester wants to create a Raft server. the ports
@@ -439,7 +507,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.role = Folower
 	// rf.electionChan = make(chan struct{})
-	rf.roleChangeChan = make(chan Role)
+	rf.roleChangeChan = make(chan Role, 1)
 	rf.heartBeatTime = time.Now()
 	rf.heartBeatTimeOut = randTimeOut()
 	DPrintf("Raft Node %d heartbeat timeout is %v", rf.me, rf.heartBeatTimeOut)
@@ -451,21 +519,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// rf.currentTerm = rf.log[-1].term
 
 	// 选举倒计时循环
-	go func() {
-		// TODO: 当收到AppendEnry时，重新开始倒计时
-		for {
-			if rf.role == Folower {
-				now := time.Now()
-				t := now.Sub(rf.heartBeatTime)
-				DPrintf("Raft Folower Node %d heartbeat cost %v", rf.me, t)
-				if t > rf.heartBeatTimeOut {
-					DPrintf("Raft Folower Node %d received heartbeat timeout", rf.me)
-					rf.changeRole(Candidate)
-				}
-			}
-			time.Sleep(30 * time.Millisecond)
-		}
-	}()
+	rf.changeRole(Folower)
 
 	go func() {
 		for {
@@ -473,27 +527,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case i := <-rf.roleChangeChan:
 				switch i {
 				case Candidate:
-					// time.Sleep(rf.heartBeatTimeOut	)
 					go func() {
-						rf.ProcessVote()
+						for {
+							time.Sleep(randTimeOut())
+							var r Role
+							go func() {
+								r = rf.ProcessVote()
+							}()
+							if r != Candidate {
+								return
+							}
+						}
 					}()
 				case Leader:
 					go func() {
 						for {
 							if rf.role != Leader {
-								break
+								return
 							}
 							rf.ProcessAppendEntries([]LogEntry{{Command{}, rf.currentTerm}})
-							time.Sleep(100 * time.Millisecond)
+							time.Sleep(HeartBeatInterval * time.Millisecond)
 						}
 					}()
 					// DPrintf("Raft Node %d change to %v", rf.me, i)
 				case Folower:
-					now := time.Now()
-					DPrintf("Raft Folower Node %d set heartbeat %v", rf.me, now)
-					rf.mu.Lock()
-					rf.heartBeatTime = now
-					rf.mu.Unlock()
+					rf.resetHeartBeatTimeOut()
+					go func() {
+						isTimeOut := rf.detectAppendTimeOut()
+						if isTimeOut {
+							rf.changeRole(Candidate)
+						}
+						return
+					}()
 				}
 			}
 		}
