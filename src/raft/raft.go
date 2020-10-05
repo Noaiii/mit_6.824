@@ -64,6 +64,7 @@ const (
 	Leader    Role = 1
 	Folower   Role = 2
 	Candidate Role = 3
+	Nobody    Role = 0
 
 	minTimeout = 150
 	maxTimeout = 300
@@ -193,17 +194,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	rf.heartBeatTime = time.Now()
 	rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-	}
-	if args.Term > rf.currentTerm {
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID && args.LastLogIndex >= rf.lastApplied) || args.Term >= rf.currentTerm {
+		// 候选人的日志至少和自己一样新，那么就投票给他
 		if !rf.isFollower() {
 			rf.changeRole(Folower)
 		}
-	}
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateID && args.LastLogIndex >= rf.lastApplied {
-		// 候选人的日志至少和自己一样新，那么就投票给他
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateID
@@ -212,7 +207,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = args.Term
 		reply.VoteGranted = true
 		DPrintf("Raft Node %d vote for: %d", rf.me, args.CandidateID)
+		return
 	}
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	return
 }
 
 //
@@ -281,10 +280,12 @@ func (rf *Raft) ProcessVote() Role {
 				defer rf.wg.Done()
 				ok := rf.sendRequestVote(peerIndex, args, reply)
 				if ok {
-					DPrintf("Raft Node %d requestVote res: %v", rf.me, reply)
+					DPrintf("Raft Node %d requestVote to node %d res: %v", rf.me, peerIndex, reply)
 					if reply.VoteGranted {
 						voteCount++
 					}
+				} else {
+					DPrintf("Raft Node %d requestVote to node %d timeout", rf.me, peerIndex)
 				}
 			}(i)
 		}
@@ -296,6 +297,7 @@ func (rf *Raft) ProcessVote() Role {
 		rf.changeRole(Leader)
 		return Leader
 	}
+	DPrintf("Raft Node %d voted failed, will be %d", rf.me, rf.role)
 	return rf.role
 }
 
@@ -326,17 +328,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			reply.Success = false
 			// rf.changeRole(Candidate)
-		} else {
-			if !rf.isFollower() {
-				rf.changeRole(Folower)
-			}
-			reply.Term = rf.currentTerm
-			reply.Success = true
+			return
 		}
-	} else {
-		reply.Term = args.Term
+		if !rf.isFollower() {
+			rf.changeRole(Folower)
+		}
+		reply.Term = rf.currentTerm
 		reply.Success = true
+		return
 	}
+	reply.Term = args.Term
+	reply.Success = true
+	return
 	// heartbeat
 }
 
@@ -363,7 +366,7 @@ func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
 				defer rf.wg.Done()
 				ok := rf.sendAppendEntries(peerIndex, args, reply)
 				if ok {
-					DPrintf("Raft Node %d AppendEntries res: %v", rf.me, reply)
+					DPrintf("Raft Node %d AppendEntries to %d res: %v", rf.me, peerIndex, reply)
 					if reply.Success {
 						succeedCount++
 					} else {
@@ -371,6 +374,8 @@ func (rf *Raft) ProcessAppendEntries(entry []LogEntry) {
 							rf.changeRole(Folower)
 						}
 					}
+				} else {
+					DPrintf("Raft Node %d AppendEntries to %d timeout", rf.me, peerIndex)
 				}
 			}(i)
 		}
@@ -423,6 +428,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.changeRole(Nobody)
 }
 
 func (rf *Raft) killed() bool {
@@ -459,7 +465,7 @@ func (rf *Raft) changeRole(r Role) {
 	rf.roleChangeChan <- r
 }
 
-func (rf *Raft) detectAppendTimeOut() bool {
+func (rf *Raft) detectHeartBeatTimeOut() bool {
 	for {
 		if !rf.isFollower() {
 			return false
@@ -482,6 +488,58 @@ func (rf *Raft) resetHeartBeatTimeOut() {
 	rf.mu.Lock()
 	rf.heartBeatTime = now
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) electionLoop() {
+	for {
+		time.Sleep(randTimeOut())
+		var r Role
+		go func() {
+			r = rf.ProcessVote()
+			DPrintf("Raft Node %d process vote done: %v, %v", rf.me, rf.role, r)
+		}()
+		if r != Candidate {
+			return
+		}
+	}
+}
+
+func (rf *Raft) heartBeatLoop() {
+	for {
+		if rf.role != Leader {
+			return
+		}
+		rf.ProcessAppendEntries([]LogEntry{{Command{}, rf.currentTerm}})
+		time.Sleep(HeartBeatInterval * time.Millisecond)
+	}
+}
+
+func (rf *Raft) changeRoleEventHandler() {
+	select {
+	case i := <-rf.roleChangeChan:
+		switch i {
+		case Candidate:
+			go func() {
+				rf.electionLoop()
+			}()
+		case Leader:
+			go func() {
+				rf.heartBeatLoop()
+			}()
+			// DPrintf("Raft Node %d change to %v", rf.me, i)
+		case Folower:
+			rf.resetHeartBeatTimeOut()
+			go func() {
+				isTimeOut := rf.detectHeartBeatTimeOut()
+				if isTimeOut {
+					rf.changeRole(Candidate)
+				}
+				return
+			}()
+		default:
+			return
+		}
+	}
 }
 
 // Make the service or tester wants to create a Raft server. the ports
@@ -522,45 +580,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.changeRole(Folower)
 
 	go func() {
-		for {
-			select {
-			case i := <-rf.roleChangeChan:
-				switch i {
-				case Candidate:
-					go func() {
-						for {
-							time.Sleep(randTimeOut())
-							var r Role
-							go func() {
-								r = rf.ProcessVote()
-							}()
-							if r != Candidate {
-								return
-							}
-						}
-					}()
-				case Leader:
-					go func() {
-						for {
-							if rf.role != Leader {
-								return
-							}
-							rf.ProcessAppendEntries([]LogEntry{{Command{}, rf.currentTerm}})
-							time.Sleep(HeartBeatInterval * time.Millisecond)
-						}
-					}()
-					// DPrintf("Raft Node %d change to %v", rf.me, i)
-				case Folower:
-					rf.resetHeartBeatTimeOut()
-					go func() {
-						isTimeOut := rf.detectAppendTimeOut()
-						if isTimeOut {
-							rf.changeRole(Candidate)
-						}
-						return
-					}()
-				}
-			}
+		for rf.dead != 1 {
+			rf.changeRoleEventHandler()
 		}
 	}()
 	return rf
